@@ -1,0 +1,46 @@
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "./generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id String @id @default(cuid())
+  name String
+  email String @unique
+  password String
+  status UserStatus @default(PENDING)
+  two_factor_secret String?
+  is2FAEnabled Boolean @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@index([email])
+}
+
+model Token {
+  id String @id @default(cuid())
+  user_id String
+  user User @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  token String
+  type TokenType
+  createdAt DateTime @default(now())
+  expiresAt DateTime
+  @@index([user_id])
+  @@index([token])
+}
+
+
+enum UserStatus {
+  PENDING
+  ACTIVE
+}
+
+enum TokenType {
+  CONFIRMATION
+  REFRESH
+}

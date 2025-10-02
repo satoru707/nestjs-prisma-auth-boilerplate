@@ -5,7 +5,6 @@ import { PrismaService } from './prisma.service';
 import { AuthModule } from './module/auth/auth.module';
 import { ConfigModule } from '@nestjs/config';
 
-// nest g resource <name>
 @Module({
   imports: [AuthModule, ConfigModule.forRoot()],
   controllers: [AppController],

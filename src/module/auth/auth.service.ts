@@ -11,13 +11,15 @@ import {
 import bcrypt from 'node_modules/bcryptjs';
 import qrcode from 'qrcode';
 import speakeasy from '@levminer/speakeasy';
-import { sign } from 'jsonwebtoken';
+import { sign, verify } from 'jsonwebtoken';
 import { OAuth2Client } from 'google-auth-library';
 import nodemailer from 'nodemailer';
+import { jwtPayload } from 'src/types/types';
 
 @Injectable()
 export class AuthService {
   constructor(private prisma: PrismaService) {}
+
   async create(createAuthDto: CreateAuthDto) {
     try {
       const hashed = await bcrypt.hash(createAuthDto.password, 10);
@@ -35,7 +37,9 @@ export class AuthService {
         },
       });
       const nonce = crypto.randomBytes(32).toString('hex');
-      await send_mail(user, nonce);
+      const sent = await this.send_mail(user, nonce);
+      if (sent.errors)
+        return createErrorResponse([{ message: sent.errors[0].message }]);
       await this.prisma.token.create({
         data: {
           user_id: user.id,
@@ -59,15 +63,23 @@ export class AuthService {
       });
       if (!userExists)
         return createErrorResponse([{ message: 'User does not exist' }]);
-      const pass = bcrypt.compare(checkAuthDto.password, userExists.password);
+      const pass = await bcrypt.compare(
+        checkAuthDto.password,
+        userExists.password,
+      );
       if (!pass)
         return createErrorResponse([
           { message: 'Invalid Credentials or Login method' },
         ]);
       if (userExists.status == 'PENDING') {
-        // resend a verification mail
-        await send_mail(userExists, userExists.tokens[0].token);
-        return createErrorResponse([{ message: 'Verify email' }]);
+        const sent = await this.send_mail(
+          userExists,
+          userExists.tokens[0].token,
+        );
+        if (sent.errors)
+          return createErrorResponse([{ message: sent.errors[0].message }]);
+
+        return createErrorResponse([{ message: 'Email not verified' }]);
       }
 
       if (userExists.is2FAEnabled) return createSuccessResponse('2FA Enabled');
@@ -76,6 +88,53 @@ export class AuthService {
     } catch (error) {
       console.error(error);
       return createErrorResponse([{ message: 'Error logging in' }]);
+    }
+  }
+
+  async logout(res: Response) {
+    try {
+      const token = res.cookie['access_token'];
+      if (token) {
+        if (process.env.JWT_SECRET) {
+          const decoded = verify(token, process.env.JWT_SECRET) as jwtPayload;
+          await this.prisma.token.delete({
+            where: { user_id_type: { user_id: decoded.sub, type: 'REFRESH' } },
+          });
+        }
+      }
+      res.clearCookie('access_token');
+      res.clearCookie('refresh_token');
+      return createSuccessResponse('Logged out successfully');
+    } catch (error) {
+      console.error(error);
+      return createErrorResponse([{ message: 'Error logging out' }]);
+    }
+  }
+
+  async verify_email(nonce: string) {
+    try {
+      const token_exists = await this.prisma.token.findFirst({
+        where: { token: nonce },
+      });
+      if (!token_exists)
+        return createErrorResponse([{ message: 'Invalid email link' }]);
+      if (token_exists.expiresAt < new Date())
+        return createErrorResponse([{ message: 'Invalid email link' }]);
+      if (token_exists.user_id) {
+        await this.prisma.user.update({
+          where: { id: token_exists.user_id },
+          data: { status: 'ACTIVE' },
+        });
+      }
+      await this.prisma.token.delete({
+        where: {
+          id: token_exists.id,
+        },
+      });
+      return createSuccessResponse('Email verified');
+    } catch (error) {
+      console.error(error);
+      return createErrorResponse([{ message: 'Invalid email link' }]);
     }
   }
 
@@ -88,7 +147,7 @@ export class AuthService {
         where: { token: refresh },
         include: { user: true },
       });
-      if (!valid_token)
+      if (!valid_token || valid_token.user == null)
         return createErrorResponse([{ message: 'Invalid or Expired token' }]);
       if (valid_token.expiresAt < new Date())
         return createErrorResponse([{ message: 'Invalid or Expired token' }]);
@@ -100,8 +159,15 @@ export class AuthService {
     }
   }
 
-  async enable_two_factor_auth(user_id: string) {
+  async enable_two_factor_auth(res: Response) {
     try {
+      if (!process.env.JWT_SECRET)
+        return createErrorResponse([{ message: 'Server Error' }]);
+      const token = verify(
+        res.req.cookies.access_token,
+        process.env.JWT_SECRET,
+      ) as jwtPayload;
+      const user_id = token.sub;
       const user = await this.prisma.user.findFirst({
         where: { id: user_id },
       });
@@ -123,7 +189,7 @@ export class AuthService {
     }
   }
 
-  async verify_2fa(user_email: string, res: Response) {
+  async verify_2fa(user_email: string, code: string, res: Response) {
     try {
       const user = await this.prisma.user.findFirst({
         where: { email: user_email },
@@ -134,7 +200,7 @@ export class AuthService {
       const verified = speakeasy.totp.verify({
         secret: user.two_factor_secret,
         encoding: 'base32',
-        token: user.two_factor_secret,
+        token: code,
       });
       if (!verified) {
         return createErrorResponse([{ message: 'Invalid 2FA code' }]);
@@ -188,21 +254,56 @@ export class AuthService {
     }
   }
 
-  async reset_password(resetDto: LoginDto) {
+  async request_reset(email: string) {
     try {
       const user = await this.prisma.user.findFirst({
-        where: { email: resetDto.email },
+        where: { email: email },
       });
       if (!user)
         return createErrorResponse([{ message: 'User does not exist' }]);
-      await this.prisma.user.update({
-        where: {
-          id: user.id,
-        },
+      const nonce = crypto.randomBytes(32).toString('hex');
+      await this.prisma.token.create({
         data: {
-          password: resetDto.password,
+          token: nonce,
+          type: 'CONFIRMATION',
+          user_id: user.id,
+          expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
         },
       });
+      await this.send_mail(user, nonce);
+      return createSuccessResponse('Email sent');
+    } catch (error) {
+      console.error(error);
+      return createErrorResponse([{ message: 'Error requesting reset' }]);
+    }
+  }
+
+  async reset_password(resetDto: LoginDto) {
+    try {
+      const token = await this.prisma.token.findFirst({
+        where: { token: resetDto.nonce, type: 'CONFIRMATION' },
+      });
+      if (!token)
+        return createErrorResponse([{ message: 'User does not exist' }]);
+      await this.prisma.token.delete({
+        where: {
+          id: token.id,
+          user_id: token.user_id,
+          type: 'CONFIRMATION',
+        },
+      });
+      if (token.user_id) {
+        await this.prisma.user.update({
+          where: {
+            id: token.user_id,
+          },
+          data: {
+            password: resetDto.password,
+            updatedAt: new Date(),
+          },
+        });
+      }
+
       return createSuccessResponse('Password reset successfull');
     } catch (error) {
       console.error(error);
@@ -211,7 +312,7 @@ export class AuthService {
   }
 
   async set_token(
-    user: { name: string; email: string; id: string; role: string },
+    user: { name: string; email: string; id: string },
     res: Response,
   ) {
     try {
@@ -241,9 +342,10 @@ export class AuthService {
           },
         });
       }
-
+      if (!process.env.JWT_SECRET)
+        return createErrorResponse([{ message: 'Internal Server Error' }]);
       const jwt_token = sign(
-        { sub: user.id, email: user.email, role: user.role },
+        { sub: user.id, email: user.email },
         process.env.JWT_SECRET,
         { expiresIn: '1h' },
       );
@@ -263,17 +365,16 @@ export class AuthService {
       console.error(error);
     }
   }
-}
 
-async function send_mail(
-  user: { email: string; name: string; status: string },
-  nonce: string,
-) {
-  try {
-    let mail, title;
-    if (user.status == 'PENDING') {
-      title = `Welcome to WealthWave, ${user.name}! Verify Your Email`;
-      mail = `
+  async send_mail(
+    user: { email: string; name: string; status: string; family_name?: string },
+    nonce: string,
+  ) {
+    try {
+      let mail, title;
+      if (user.status == 'PENDING') {
+        title = `Welcome to WealthWave, ${user.name}! Verify Your Email`;
+        mail = `
     <!DOCTYPE html>
     <html lang="en">
     <head>
@@ -302,7 +403,7 @@ async function send_mail(
             <a href="https://your-api.com/api/auth/verify?token=${nonce}" class="button">Verify Email</a>
           </p>
           <p>If the button doesn't work, copy and paste this link into your browser:</p>
-          <p><a href="https://your-api.com/api/auth/verify?token=${nonce}">https://your-api.com/api/auth/verify?token=${nonce}</a></p>
+          <p><a href="${process.env.CLIENT_URL}/api/auth/verify?token=${nonce}">${process.env.CLIENT_URL}/api/auth/verify?token=${nonce}</a></p>
           <p>This link expires in 24 hours.</p>
         </div>
         <div class="footer">
@@ -312,9 +413,12 @@ async function send_mail(
     </body>
     </html>
   `;
-    } else {
-      title = `Password Reset Request for WealthWave, ${user.name}`;
-      mail = `
+      } else if (user.status == 'FAMILY') {
+        title = '';
+        mail = '';
+      } else {
+        title = `Password Reset Request for WealthWave, ${user.name}`;
+        mail = `
     <!DOCTYPE html>
     <html lang="en">
     <head>
@@ -343,7 +447,7 @@ async function send_mail(
             <a href="https://your-app.com/reset-password?token=${nonce}" class="button">Reset Password</a>
           </p>
           <p>If the button doesn't work, copy and paste this link into your browser:</p>
-          <p><a href="https://your-app.com/reset-password?token=${nonce}">https://your-app.com/reset-password?token=${nonce}</a></p>
+          <p><a href="${process.env.CLIENT_URL}/reset-password?token=${nonce}">${process.env.CLIENT_URL}/reset-password?token=${nonce}</a></p>
           <p>This link expires in 24 hours. If you didn’t request a password reset, please ignore this email or contact support.</p>
         </div>
         <div class="footer">
@@ -353,26 +457,28 @@ async function send_mail(
     </body>
     </html>
   `;
+      }
+
+      let transporter = nodemailer.createTransport({
+        service: 'gmail',
+        auth: {
+          user: process.env.EMAIL_USER,
+          pass: process.env.EMAIL_PASS,
+        },
+      });
+
+      let mailOptions = {
+        from: process.env.EMAIL_USER,
+        to: user.email,
+        subject: title,
+        html: mail,
+      };
+      await transporter.sendMail(mailOptions);
+      return createSuccessResponse('Email sent successfully');
+    } catch (error) {
+      console.error(error);
+      return createErrorResponse([{ message: 'Error sending mail' }]);
     }
-
-    let transporter = nodemailer.createTransport({
-      service: 'gmail',
-      auth: {
-        user: process.env.EMAIL_USER,
-        pass: process.env.EMAIL_PASS,
-      },
-    });
-
-    let mailOptions = {
-      from: process.env.EMAIL_USER,
-      to: user.email,
-      subject: title,
-      html: mail,
-    };
-    await transporter.sendMail(mailOptions);
-    return createSuccessResponse('Email sent successfully');
-  } catch (error) {
-    console.error(error);
-    return createErrorResponse([{ message: 'Error sending mail' }]);
   }
 }
+

@@ -11,10 +11,14 @@ It supports email/password authentication, Google OAuth, refresh tokens, and 2FA
 - **Login** with access + refresh tokens (JWT)  
 - **Google OAuth** ready (React & Flutter snippets provided)  
 - **2FA (Google Authenticator)** verification flow included  
-- **Password Reset** via email link  
+- **Password Reset** via email link with signed tokens  
 - **Cookies for Auth** (HTTP-only access & refresh cookies)  
 - **Prisma ORM** with PostgreSQL schema  
-- **Extendable** → Add phone/email OTP auth, or custom integrations  
+- **Swagger Documentation** for API testing and exploration  
+- **Phone Number OTP Auth** (SMS/WhatsApp integration ready)  
+- **Email OTP Login** as an alternative to password/Google  
+- **Unit & Integration Tests** for robust reliability  
+- **Extendable** → Add custom integrations (e.g., Stripe for payments)
 
 ---
 
@@ -26,6 +30,9 @@ It supports email/password authentication, Google OAuth, refresh tokens, and 2FA
 - **JWT** – Authentication tokens  
 - **Nodemailer** – Email handling  
 - **Google OAuth** – Third-party login  
+- **Swagger** – API documentation  
+- **Speakeasy** – 2FA with Google Authenticator  
+- **Twilio/Nexmo** – Phone OTP (optional) 
 
 ---
 
@@ -40,16 +47,15 @@ It supports email/password authentication, Google OAuth, refresh tokens, and 2FA
 
 ### Installation
 ```bash
-git clone <repo-url>
-cd nest-auth-prisma-boilerplate
+git clone https://github.com/satoru707/nestjs-prisma-auth-boilerplate.git
+cd nest-prisma-auth-boilerplate
 pnpm install
 ````
 
 ### Prisma Setup
 
 ```bash
-pnpm prisma generate
-pnpm prisma db push
+pnpm prisma 
 ```
 
 ### Environment Variables
@@ -79,7 +85,9 @@ EMAIL_PASS="your-app-password"
 | `/auth/google`         | POST   | Google OAuth login (send `code`)                              |
 | `/auth/refresh`        | GET    | Refresh expired access token using refresh token              |
 | `/auth/verify_2fa`     | POST   | Verify Google Authenticator 2FA code                          |
+| `/auth/enable_2fa`     | POST   | Enable 2FA and generate QR code for Google Authenticator      |
 | `/auth/reset_password` | POST   | Reset password via email link + new password                  |
+| `/auth/request_reset`  | POST   | Request password reset email with signed token                |
 
 ---
 
@@ -94,10 +102,12 @@ model User {
   status UserStatus @default(PENDING)
   two_factor_secret String?
   is2FAEnabled Boolean @default(false)
+  tokens Token[]
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
   @@index([email])
 }
+
 
 model Token {
   id String @id @default(cuid())
@@ -229,5 +239,3 @@ Future<void> handleCallback(String code) async {
 
 MIT License. Use, modify, and contribute freely.
 
-```
-```
